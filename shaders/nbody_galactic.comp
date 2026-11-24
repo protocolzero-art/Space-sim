@@ -1,0 +1,107 @@
+#version 460
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+struct Body {
+    vec4 posMass;
+    vec4 velTemp;
+    vec4 accRadius;
+    vec4 meta;
+};
+
+layout(std430, set = 0, binding = 0) buffer BodyBuffer {
+    Body bodies[];
+};
+
+layout(push_constant) uniform SimConstants {
+    float dt;
+    float G_sim;
+    float softeningSq;
+    float darkMatterHaloMass;
+    float darkMatterScaleR;
+    float cSpeedSq;
+    uint  bodyCount;
+    uint  stepPhase;
+} pc;
+
+shared vec4 tilePosMass[128];
+
+vec3 computeNFWHaloAccel(vec3 pos) {
+    float r = length(pos);
+    if (r < 1e-4) return vec3(0.0);
+    float x = r / pc.darkMatterScaleR;
+    float mEnc = pc.darkMatterHaloMass * (log(1.0 + x) - x / (1.0 + x));
+    return -(pc.G_sim * mEnc / (r * r * r + pc.softeningSq)) * pos;
+}
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    bool active = idx < pc.bodyCount;
+
+    Body self;
+    if (active) {
+        self = bodies[idx];
+    } else {
+        self.posMass = vec4(0.0);
+        self.velTemp = vec4(0.0);
+        self.accRadius = vec4(0.0);
+        self.meta = vec4(0.0);
+    }
+
+    // Phase 0 has no workgroup barriers, so inactive lanes can skip its work.
+    if (pc.stepPhase == 0u) {
+        if (active) {
+            self.velTemp.xyz += 0.5 * pc.dt * self.accRadius.xyz;
+            self.posMass.xyz += pc.dt * self.velTemp.xyz;
+            bodies[idx] = self;
+        }
+        return;
+    }
+
+    // Phase 1 uses shared-memory barriers. All lanes must participate, even
+    // when the final workgroup contains indices beyond bodyCount.
+    vec3 totalAcc = active ? computeNFWHaloAccel(self.posMass.xyz) : vec3(0.0);
+    uint numTiles = (pc.bodyCount + 127u) / 128u;
+
+    for (uint tile = 0u; tile < numTiles; ++tile) {
+        uint loadIdx = tile * 128u + gl_LocalInvocationID.x;
+        tilePosMass[gl_LocalInvocationID.x] = (loadIdx < pc.bodyCount)
+            ? bodies[loadIdx].posMass
+            : vec4(0.0);
+        barrier();
+
+        if (active) {
+            for (uint j = 0u; j < 128u; ++j) {
+                vec4 other = tilePosMass[j];
+                if (other.w <= 0.0) continue;
+
+                vec3 rVec = other.xyz - self.posMass.xyz;
+                float distSq = dot(rVec, rVec) + pc.softeningSq;
+                float invDist = inversesqrt(distSq);
+                float invDist3 = invDist * invDist * invDist;
+
+                vec3 aNewt = (pc.G_sim * other.w * invDist3) * rVec;
+
+                if (other.w > 1.0e5) {
+                    float v2 = dot(self.velTemp.xyz, self.velTemp.xyz);
+                    float grFactor = 1.0 + (3.0 * v2) / max(pc.cSpeedSq, 1.0);
+                    aNewt *= grFactor;
+                }
+                totalAcc += aNewt;
+            }
+        }
+        barrier();
+    }
+
+    if (active) {
+        self.velTemp.xyz += 0.5 * pc.dt * totalAcc;
+        self.accRadius.xyz = totalAcc;
+
+        float centerDist = length(self.posMass.xyz);
+        if (centerDist < 4.0 && self.meta.x < 5.0) {
+            self.velTemp.w = min(self.velTemp.w + 45.0 * pc.dt, 35000.0);
+        }
+
+        bodies[idx] = self;
+    }
+}

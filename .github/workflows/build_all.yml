@@ -1,0 +1,105 @@
+name: Build AETHERIA-GR (Staged ARM64 APK + Windows x64)
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+    inputs:
+      stage:
+        description: 'Build Stage (0=Triangle Smoke Test, 1=Kerr BH, 2=Full Cosmos)'
+        required: true
+        default: '0'
+        type: choice
+        options:
+          - '0'
+          - '1'
+          - '2'
+
+jobs:
+  build-android-apk:
+    runs-on: ubuntu-latest
+    env:
+      BUILD_STAGE: ${{ github.event.inputs.stage || '0' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Fetch SDL3 Java Bridge
+        run: |
+          git clone --depth 1 --branch release-3.2.8 https://github.com/libsdl-org/SDL.git /tmp/sdl3
+          mkdir -p android/app/src/main/sdl-java
+          cp -r /tmp/sdl3/android-project/app/src/main/java/* android/app/src/main/sdl-java/
+
+      - name: Setup Android SDK, NDK r27 & CMake
+        uses: android-actions/setup-android@v3
+      - run: sdkmanager "ndk;27.2.12479018" "cmake;3.22.1" "platforms;android-35" "build-tools;35.0.0"
+
+      - name: Setup Gradle 8.9
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.9
+
+      - name: Prepare Persistent (or Fallback) Keystore & Build ARM64 APK
+        env:
+          KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          KEYSTORE_PATH: /tmp/aetheria.jks
+          KEYSTORE_PASS: ${{ secrets.KEYSTORE_PASS || 'aetheria2026' }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS || 'aetheria' }}
+          KEY_PASS: ${{ secrets.KEY_PASS || 'aetheria2026' }}
+        run: |
+          if [ -n "$KEYSTORE_B64" ]; then
+            echo "$KEYSTORE_B64" | base64 --decode > "$KEYSTORE_PATH"
+          else
+            keytool -genkeypair -v -keystore "$KEYSTORE_PATH" -storepass "$KEYSTORE_PASS" \
+              -keypass "$KEY_PASS" -alias "$KEY_ALIAS" -keyalg RSA -keysize 2048 -validity 10000 \
+              -dname "CN=AetheriaGR, OU=Astrophysics, O=Zero, L=Lucknow, ST=UP, C=IN"
+          fi
+          cd android
+          gradle assembleRelease -PaetheriaStage="${BUILD_STAGE}" --no-daemon
+
+      - name: Verify Packed Shaders, Native Libs & APK Signature
+        shell: bash
+        run: |
+          set -euo pipefail
+          APK="android/app/build/outputs/apk/release/app-release.apk"
+          echo "--- Checking expected SPIR-V shaders ---"
+          for shader in fullscreen.vert kerr_blackhole.comp nbody_galactic.comp nebula_volumetric.frag stage0_triangle.vert stage0_triangle.frag stars_instanced.vert stars_instanced.frag; do
+            unzip -l "$APK" | grep -q "assets/shaders/${shader}.spv" || { echo "Missing shader: ${shader}.spv"; exit 1; }
+          done
+          echo "--- Checking ARM64 native libraries ---"
+          for lib in libSDL3.so libmain.so libc++_shared.so; do
+            unzip -l "$APK" | grep -q "lib/arm64-v8a/${lib}" || { echo "Missing native library: ${lib}"; exit 1; }
+          done
+          "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --verbose --print-certs "$APK"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: AETHERIA-GR-Stage${{ env.BUILD_STAGE }}-OPPO-arm64
+          path: android/app/build/outputs/apk/release/app-release.apk
+
+  build-desktop-windows:
+    runs-on: windows-latest
+    env:
+      BUILD_STAGE: ${{ github.event.inputs.stage || '0' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Vulkan SDK
+        uses: humbletim/setup-vulkan-sdk@v1.2.0
+        with:
+          vulkan-query-version: latest
+          vulkan-components: core
+
+      - name: Configure & Build Release x64
+        run: |
+          cmake -B build -G "Visual Studio 17 2022" -A x64 -DAETHERIA_STAGE=${{ env.BUILD_STAGE }}
+          cmake --build build --config Release --parallel
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: AETHERIA-GR-Stage${{ env.BUILD_STAGE }}-Windows-x64
+          path: build/Release/

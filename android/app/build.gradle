@@ -1,0 +1,108 @@
+plugins {
+    id 'com.android.application'
+}
+
+def aetheriaStage = project.hasProperty('aetheriaStage') ? project.property('aetheriaStage') : '0'
+
+android {
+    namespace 'com.aetheria.gr'
+    compileSdk 35
+    ndkVersion '27.2.12479018'
+
+    defaultConfig {
+        applicationId 'com.aetheria.gr'
+        minSdk 29
+        targetSdk 35
+        versionCode 1
+        versionName "1.0-stage${aetheriaStage}"
+
+        ndk {
+            abiFilters 'arm64-v8a'
+        }
+        externalNativeBuild {
+            cmake {
+                arguments '-DANDROID_STL=c++_shared',
+                          '-DCMAKE_BUILD_TYPE=Release',
+                          "-DAETHERIA_STAGE=${aetheriaStage}"
+                cppFlags '-std=c++20 -O3'
+            }
+        }
+    }
+
+    externalNativeBuild {
+        cmake {
+            path file('../../CMakeLists.txt')
+            version '3.22.1'
+        }
+    }
+
+    sourceSets {
+        main {
+            java.srcDirs = ['src/main/java', 'src/main/sdl-java']
+            assets.srcDirs = ['src/main/assets']
+        }
+    }
+
+    signingConfigs {
+        release {
+            def ksPath = System.getenv("KEYSTORE_PATH")
+            if (ksPath != null && file(ksPath).exists()) {
+                storeFile file(ksPath)
+                storePassword System.getenv("KEYSTORE_PASS")
+                keyAlias System.getenv("KEY_ALIAS") ?: "aetheria"
+                keyPassword System.getenv("KEY_PASS") ?: System.getenv("KEYSTORE_PASS")
+            }
+        }
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+            def ksPath = System.getenv("KEYSTORE_PATH")
+            signingConfig (ksPath != null && file(ksPath).exists())
+                ? signingConfigs.release
+                : signingConfigs.debug
+        }
+    }
+}
+
+def shaderSourceTree = fileTree('../../shaders') {
+    include '**/*.comp', '**/*.vert', '**/*.frag'
+}
+
+tasks.register('compileShaders') {
+    inputs.files(shaderSourceTree)
+    outputs.dir(file('src/main/assets/shaders'))
+
+    doLast {
+        def ndkDir = android.ndkDirectory
+        def hostTag = org.gradle.internal.os.OperatingSystem.current().isWindows() ? 'windows-x86_64' :
+                      org.gradle.internal.os.OperatingSystem.current().isMacOsX()  ? 'darwin-x86_64'  : 'linux-x86_64'
+        def glslc = new File(ndkDir, "shader-tools/${hostTag}/glslc" + (hostTag.startsWith('windows') ? '.exe' : ''))
+        if (!glslc.exists()) {
+            throw new GradleException("NDK glslc not found at: ${glslc}. Install NDK ${android.ndkVersion} in Android SDK.")
+        }
+
+        if (!shaderSourceTree.files || shaderSourceTree.files.isEmpty()) {
+            throw new GradleException("No GLSL shader sources found under ../../shaders")
+        }
+
+        def outDir = file('src/main/assets/shaders')
+        outDir.mkdirs()
+        // Remove stale SPIR-V files so deleted/renamed shaders cannot ship in the APK.
+        outDir.listFiles()?.findAll { it.name.endsWith('.spv') }?.each { it.delete() }
+
+        shaderSourceTree.files.sort { it.path }.each { srcFile ->
+            def relativeName = file('../../shaders').toPath().relativize(srcFile.toPath()).toString()
+            def spvOut = new File(outDir, "${relativeName}.spv")
+            spvOut.parentFile.mkdirs()
+            exec {
+                commandLine glslc.absolutePath, '--target-env=vulkan1.1', '-O', srcFile.absolutePath, '-o', spvOut.absolutePath
+            }
+        }
+    }
+}
+
+tasks.named('preBuild').configure {
+    dependsOn('compileShaders')
+}

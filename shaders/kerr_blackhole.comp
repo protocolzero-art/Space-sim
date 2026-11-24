@@ -1,0 +1,204 @@
+#version 460
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, rgba16f) uniform writeonly image2D outHdrImage;
+
+layout(set = 0, binding = 1) uniform KerrUBO {
+    mat4 invViewProj;
+    vec4 cameraPosTime;
+    vec4 bhParams;
+    vec4 diskVisuals;
+    vec4 nebulaParams;
+    ivec4 screenProfile;
+} ubo;
+
+float hash31(vec3 p) {
+    p = fract(p * 0.1031);
+    p += dot(p, p.yzx + 33.33);
+    return fract((p.x + p.y) * p.z);
+}
+
+float noise3D(vec3 x) {
+    vec3 i = floor(x);
+    vec3 f = fract(x);
+    f = f * f * (3.0 - 2.0 * f);
+    return mix(
+        mix(mix(hash31(i + vec3(0,0,0)), hash31(i + vec3(1,0,0)), f.x),
+            mix(hash31(i + vec3(0,1,0)), hash31(i + vec3(1,1,0)), f.x), f.y),
+        mix(mix(hash31(i + vec3(0,0,1)), hash31(i + vec3(1,0,1)), f.x),
+            mix(hash31(i + vec3(0,1,1)), hash31(i + vec3(1,1,1)), f.x), f.y),
+        f.z
+    );
+}
+
+float fbmDisk(vec3 p) {
+    float v = 0.0;
+    float amp = 0.52;
+    for (int i = 0; i < 4; ++i) {
+        v += amp * noise3D(p);
+        p = p * 2.13 + vec3(13.7, -5.2, 8.9);
+        amp *= 0.48;
+    }
+    return v;
+}
+
+vec3 blackbodyRGB(float tempK) {
+    float t = clamp(tempK, 1000.0, 40000.0) / 100.0;
+    vec3 c;
+    c.r = (t <= 66.0) ? 1.0 : clamp(1.292936 * pow(t - 60.0, -0.1332047), 0.0, 1.0);
+    c.g = (t <= 66.0) ? clamp(0.3900815 * log(t) - 0.6318414, 0.0, 1.0)
+                      : clamp(1.1298908 * pow(t - 60.0, -0.0755148), 0.0, 1.0);
+    c.b = (t >= 66.0) ? 1.0 : ((t <= 19.0) ? 0.0 : clamp(0.5432067 * log(t - 10.0) - 1.196254, 0.0, 1.0));
+    return pow(c, vec3(2.2));
+}
+
+vec3 geodesicAccel(vec3 pos, vec3 vel, float M, float spinA) {
+    float r2 = dot(pos, pos);
+    float r  = sqrt(r2);
+    float r5 = r2 * r2 * r;
+    vec3 L   = cross(pos, vel);
+    float h2 = dot(L, L);
+
+    vec3 aSchw = (-1.5 * (2.0 * M) * h2 / max(r5, 1e-5)) * pos;
+
+    vec3 spinVec = vec3(0.0, spinA * M, 0.0);
+    vec3 B_g = (3.0 * dot(spinVec, pos) * pos - r2 * spinVec) / max(r5, 1e-5);
+    vec3 aKerr = 2.0 * cross(vel, B_g);
+
+    return aSchw + aKerr;
+}
+
+void rk4Step(inout vec3 pos, inout vec3 vel, float h, float M, float spinA) {
+    vec3 k1v = geodesicAccel(pos, vel, M, spinA);
+    vec3 k1x = vel;
+
+    vec3 k2v = geodesicAccel(pos + 0.5 * h * k1x, vel + 0.5 * h * k1v, M, spinA);
+    vec3 k2x = vel + 0.5 * h * k1v;
+
+    vec3 k3v = geodesicAccel(pos + 0.5 * h * k2x, vel + 0.5 * h * k2v, M, spinA);
+    vec3 k3x = vel + 0.5 * h * k2v;
+
+    vec3 k4v = geodesicAccel(pos + h * k3x, vel + h * k3v, M, spinA);
+    vec3 k4x = vel + h * k3v;
+
+    pos += (h / 6.0) * (k1x + 2.0 * k2x + 2.0 * k3x + k4x);
+    vel  = normalize(vel + (h / 6.0) * (k1v + 2.0 * k2v + 2.0 * k3v + k4v));
+}
+
+vec3 sampleLensedBackground(vec3 dir, float time) {
+    vec3 bg = vec3(0.004, 0.006, 0.014);
+    float plane = exp(-abs(dir.y * 0.85 + dir.x * 0.35) * 4.5);
+    float dust  = fbmDisk(dir * 5.0 + vec3(0.0, 1.4, 0.0));
+    bg += vec3(0.08, 0.12, 0.24) * plane * dust;
+    bg += vec3(0.18, 0.07, 0.14) * plane * pow(dust, 2.2);
+
+    vec3 grid = floor(dir * 260.0);
+    float s = hash31(grid);
+    if (s > 0.9965) {
+        float mag = pow((s - 0.9965) / 0.0035, 2.0);
+        float starTemp = mix(3200.0, 18000.0, hash31(grid + 17.3));
+        bg += blackbodyRGB(starTemp) * mag * 5.5;
+    }
+    return bg;
+}
+
+void main() {
+    ivec2 px = ivec2(gl_GlobalInvocationID.xy);
+    if (px.x >= ubo.screenProfile.x || px.y >= ubo.screenProfile.y) return;
+
+    vec2 uv = (vec2(px) + 0.5) / vec2(ubo.screenProfile.xy);
+    vec2 ndc = uv * 2.0 - 1.0;
+
+    float warp = ubo.diskVisuals.w;
+    ndc *= (1.0 - 0.32 * warp * dot(ndc, ndc));
+
+    vec4 clipFar = ubo.invViewProj * vec4(ndc, 1.0, 1.0);
+    vec3 rayPos  = ubo.cameraPosTime.xyz;
+    vec3 rayDir  = normalize(clipFar.xyz / clipFar.w - rayPos);
+
+    float time      = ubo.cameraPosTime.w;
+    float M         = ubo.bhParams.x;
+    float spinA     = ubo.bhParams.y;
+    float rISCO     = ubo.bhParams.z * M;
+    float rOuter    = ubo.bhParams.w * M;
+    float rHorizon  = (1.0 + sqrt(max(0.001, 1.0 - spinA * spinA))) * M;
+    int maxSteps    = ubo.screenProfile.z;
+
+    vec3 accumLight    = vec3(0.0);
+    float transmittance = 1.0;
+    bool hitHorizon    = false;
+
+    for (int step = 0; step < maxSteps; ++step) {
+        float r = length(rayPos);
+
+        if (r <= rHorizon * 1.02) {
+            hitHorizon = true;
+            break;
+        }
+        if (r > 180.0 && step > 16) {
+            break;
+        }
+
+        float h = clamp(0.055 * (r - rHorizon * 0.85), 0.035, 2.2);
+        vec3 prevPos = rayPos;
+        rk4Step(rayPos, rayDir, h, M, spinA);
+
+        if ((prevPos.y * rayPos.y <= 0.0 || abs(rayPos.y) < 0.35 * M) && r > rISCO * 0.85 && r < rOuter) {
+            float tCross = abs(prevPos.y) / max(abs(prevPos.y - rayPos.y), 1e-5);
+            vec3 hitPos  = mix(prevPos, rayPos, clamp(tCross, 0.0, 1.0));
+            float hitR   = length(hitPos.xz);
+
+            if (hitR >= rISCO * 0.9 && hitR <= rOuter) {
+                float angle   = atan(hitPos.z, hitPos.x);
+                float omega   = 1.0 / (pow(hitR / M, 1.5) + spinA);
+                float rotAng  = angle - time * omega * 2.4;
+
+                vec3 sampleCoord = vec3(cos(rotAng) * hitR * 0.45, hitPos.y * 2.5, sin(rotAng) * hitR * 0.45);
+                float filament   = fbmDisk(sampleCoord + vec3(log(hitR) * 3.5, 0.0, 0.0));
+                float ringMask   = smoothstep(rISCO * 0.9, rISCO * 1.35, hitR) *
+                                   smoothstep(rOuter, rOuter * 0.45, hitR);
+                float vertical   = exp(-abs(hitPos.y) * 5.2);
+
+                vec3 tangentVel = normalize(vec3(-hitPos.z, 0.0, hitPos.x));
+                float beta      = clamp(sqrt(M / max(hitR, rISCO)) * 0.72, 0.0, 0.88);
+                float gamma     = inversesqrt(1.0 - beta * beta);
+                float cosTheta  = dot(tangentVel, -rayDir);
+                float gravRed   = sqrt(max(0.05, 1.0 - (2.0 * M) / hitR));
+                float gFactor   = gravRed / (gamma * (1.0 - beta * cosTheta * ubo.diskVisuals.y));
+
+                float baseTempK = 11500.0 * pow(rISCO / max(hitR, rISCO), 0.75) * gFactor;
+                vec3 diskCol    = blackbodyRGB(baseTempK);
+
+                float intensity = pow(clamp(gFactor, 0.25, 2.8), 3.4) * ubo.diskVisuals.x;
+                float density   = ringMask * vertical * (0.35 + 1.45 * filament);
+
+                accumLight += transmittance * diskCol * density * intensity * 0.42;
+                transmittance *= exp(-density * 0.38);
+                if (transmittance < 0.02) break;
+            }
+        }
+
+        float jetPower = ubo.diskVisuals.z * smoothstep(0.45, 0.98, spinA);
+        if (jetPower > 0.01 && abs(rayPos.y) > rHorizon * 1.1) {
+            float coneR = 0.28 * pow(abs(rayPos.y), 0.72) + 0.35 * M;
+            float radialDist = length(rayPos.xz);
+            if (radialDist < coneR * 1.8) {
+                float jetCore = exp(-pow(radialDist / coneR, 2.2)) * exp(-abs(rayPos.y) * 0.032);
+                float plasma  = fbmDisk(vec3(rayPos.x * 1.2, rayPos.y * 0.35 - time * 3.8 * sign(rayPos.y), rayPos.z * 1.2));
+                vec3 jetColor = mix(vec3(0.25, 0.55, 1.0), vec3(0.85, 0.92, 1.0), jetCore);
+                accumLight += transmittance * jetColor * jetCore * plasma * jetPower * h * 0.22;
+            }
+        }
+    }
+
+    if (!hitHorizon) {
+        accumLight += transmittance * sampleLensedBackground(rayDir, time);
+    }
+
+    if (warp > 0.01) {
+        accumLight += vec3(0.35, 0.65, 1.0) * warp * length(ndc) * 1.4;
+    }
+
+    imageStore(outHdrImage, px, vec4(accumLight, 1.0));
+}
