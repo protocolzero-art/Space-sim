@@ -55,13 +55,17 @@ android {
         }
     }
 
-    buildTypes {
-        release {
-            minifyEnabled false
-            def ksPath = System.getenv("KEYSTORE_PATH")
-            signingConfig (ksPath != null && file(ksPath).exists())
-                ? signingConfigs.release
-                : signingConfigs.debug
+    
+buildTypes {
+    release {
+        minifyEnabled false
+
+        def ksPath = System.getenv("KEYSTORE_PATH")
+
+        if (ksPath != null && file(ksPath).exists()) {
+            signingConfig signingConfigs.release
+        } else {
+            signingConfig signingConfigs.debug
         }
     }
 }
