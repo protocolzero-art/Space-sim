@@ -55,20 +55,19 @@ android {
         }
     }
 
-    
-buildTypes {
+    buildTypes {
     release {
         minifyEnabled false
 
         def ksPath = System.getenv("KEYSTORE_PATH")
 
         if (ksPath != null && file(ksPath).exists()) {
-            signingConfig signingConfigs.release
+            signingConfig = signingConfigs.getByName("release")
         } else {
-            signingConfig signingConfigs.debug
+            signingConfig = signingConfigs.getByName("debug")
         }
+      }
     }
-}
 
 def shaderSourceTree = fileTree('../../shaders') {
     include '**/*.comp', '**/*.vert', '**/*.frag'
