@@ -1,3 +1,4 @@
+
 name: Build AETHERIA-GR (Staged ARM64 APK + Windows x64)
 
 on:
@@ -35,7 +36,8 @@ jobs:
           cp -r /tmp/sdl3/android-project/app/src/main/java/* android/app/src/main/sdl-java/
 
       - name: Setup Android SDK, NDK r27 & CMake
-        uses: android-actions/setup-android@v3
+        uses: android-actions/setup-android@v4
+
       - run: sdkmanager "ndk;27.2.12479018" "cmake;3.22.1" "platforms;android-35" "build-tools;35.0.0"
 
       - name: Setup Gradle 8.9
